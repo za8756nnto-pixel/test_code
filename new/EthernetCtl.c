@@ -6,25 +6,27 @@
  *
  *  LWIPなし・FreeRTOSポーリングベース ETHドライバ
  *  対象MCU : STM32H745/H755 デュアルコア (CM7で動作)
- *  対象PHY : LAN8742A (RMII)
+ *  対象PHY : LAN8742A (CubeMX lan8742コンポーネント使用)
  *
  *  受信アーキテクチャ:
- *    HAL_ETH_ReadData() を使用したポーリング受信。
- *    HAL は受信時に以下の2つのweakコールバックを呼ぶ:
- *      HAL_ETH_RxAllocateCallback() : 受信バッファアドレスを HAL に渡す
- *      HAL_ETH_RxLinkCallback()     : 受信完了データを受け取る
- *    本ファイルでこれら2関数をオーバーライドする。
+ *    HAL_ETH_ReadData() ポーリング受信。
+ *    HAL_ETH_RxAllocateCallback() / HAL_ETH_RxLinkCallback() をオーバーライド。
  *
- *  送信:
- *    HAL_ETH_Transmit() (ポーリング・ブロッキング) を使用。
+ *  PHYアクセス:
+ *    lan8742コンポーネントの LAN8742_ReadReg() / LAN8742_WriteReg() を使用。
+ *    リンク確認は LAN8742_GetLinkState() を使用。
+ *
+ *  LAN8742A LED Blackout:
+ *    PHYSCSR (Reg 0x11) の LED制御ビットで強制消灯/復帰を行う。
+ *    BCR PowerDown方式はリンク自体を切断するため使用しない。
  *
  *  DCacheについて:
- *    DCacheは無効のまま使用する。
- *    有効にする場合はDMAディスクリプタ/バッファ領域のMPU設定が必要。
+ *    無効のまま使用する。有効にする場合はMPU設定が別途必要。
  */
 
 #include "EthernetCtl.h"
 #include "stm32h7xx_hal.h"
+#include "lan8742.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
@@ -34,24 +36,68 @@
 /* ============================================================
  * コンパイル設定
  * ============================================================ */
-#define ETHCTL_PHY_ADDR         0x00U   /*!< LAN8742A MDIOアドレス (要確認) */
 #define ETHCTL_LINK_POLL_MS     500U    /*!< PHYリンク監視周期 */
 #define ETHCTL_TASK_STACK       1024U   /*!< ETHタスクスタック(ワード) */
 #define ETHCTL_TASK_PRI         (tskIDLE_PRIORITY + 3U)
 
-/* RxバッファはHALが1フレーム分を1バッファで受け取る前提 */
 #define ETHCTL_RX_BUF_SIZE      1536U
-#define ETHCTL_RX_BUF_COUNT     ETH_RX_DESC_CNT   /* HAL定義(通常4) */
+#define ETHCTL_RX_BUF_COUNT     ETH_RX_DESC_CNT   /* 通常4 */
 #define ETHCTL_TX_BUF_SIZE      1536U
 
 /* ============================================================
- * LAN8742A PHY レジスタ
+ * LAN8742A レジスタ定義
+ *   lan8742.h にない独自レジスタはここで定義する
  * ============================================================ */
-#define LAN8742_REG_BCR     0x00U
-#define LAN8742_REG_BSR     0x01U
-#define LAN8742_BCR_PWRDN   (1U << 11)  /*!< Power Down: PHYパワーダウン */
-#define LAN8742_BSR_LINK    (1U <<  2)  /*!< Link Status */
-#define LAN8742_BSR_ANEG    (1U <<  5)  /*!< Auto-Negotiation Complete */
+
+/* PHY Special Control/Status Register (PHYSCSR) アドレス */
+#define LAN8742_PHYSCSR_REG         0x11U
+
+/*
+ * PHYSCSR Bit定義 (LAN8742Aデータシート Table 16 参照)
+ *
+ * Bit[15:13] : LED Mode
+ *   000 = Energy Detect(デフォルト動作)
+ *   001 = LED1=Speed, LED2=Link/Activity (よくある配線)
+ *   他  = 各種モード
+ *
+ * Bit[8] : LED1 Direct control (0=Auto, 1=強制制御)
+ * Bit[4] : LED2 Direct control (0=Auto, 1=強制制御)
+ *
+ * ※ LAN8742Aの"LED Direct"機能はSPECIAL MODES REG(Reg 0x12)で
+ *    制御する実装もある。実際の動作はボードのLED配線による。
+ *    本実装では以下の方法を採用:
+ *      Blackout ON  → PHYSCSR の LED Force off ビットをセット
+ *      Blackout OFF → PHYSCSR をデフォルト値(0x0000)に戻す
+ */
+
+/*
+ * LAN8742A Special Modes Register (Reg 0x12)
+ *   Bit[8:5] : PHYAD (PHY address)
+ *   Bit[2:0] : MODE
+ *     000 = Power Down
+ *     001 = 10BASE-T half duplex
+ *     010 = 100BASE-TX half duplex
+ *     011 = Default (Auto-Negotiation)
+ *     100 = 10BASE-T full duplex
+ *     101 = 100BASE-TX full duplex
+ *     110 = Power Down
+ *     111 = All capable Auto-Negotiation
+ */
+#define LAN8742_SPECIAL_MODES_REG   0x12U
+
+/*
+ * LAN8742A CONTROL / STATUS INDICATION Register (Reg 0x1B)
+ *   LED Direct: このレジスタでLEDを強制制御できる
+ *   Bit[4] : LED2 value when direct mode
+ *   Bit[3] : LED1 value when direct mode
+ *   Bit[0] : LED Direct Mode enable (1=強制制御)
+ */
+#define LAN8742_CTRL_STATUS_IND_REG 0x1BU
+#define LAN8742_LED_DIRECT_MODE     (1U << 0)   /*!< LED強制制御モード有効 */
+#define LAN8742_LED2_FORCE_OFF      (0U << 4)   /*!< LED2強制消灯 */
+#define LAN8742_LED1_FORCE_OFF      (0U << 3)   /*!< LED1強制消灯 */
+#define LAN8742_LED2_FORCE_ON       (1U << 4)   /*!< LED2強制点灯 */
+#define LAN8742_LED1_FORCE_ON       (1U << 3)   /*!< LED1強制点灯 */
 
 /* ============================================================
  * Ethernet プロトコル定数
@@ -91,7 +137,9 @@ typedef struct {
     uint16_t oper;
     uint8_t  sha[6]; uint8_t spa[4]; uint8_t tha[6]; uint8_t tpa[4];
 } ArpPkt_t;
-typedef struct { uint8_t type; uint8_t code; uint16_t csum; uint16_t id; uint16_t seq; } IcmpHdr_t;
+typedef struct {
+    uint8_t type; uint8_t code; uint16_t csum; uint16_t id; uint16_t seq;
+} IcmpHdr_t;
 typedef struct {
     uint8_t  op; uint8_t htype; uint8_t hlen; uint8_t hops;
     uint32_t xid; uint16_t secs; uint16_t flags;
@@ -113,37 +161,41 @@ typedef enum {
 } DhcpSt_t;
 
 /* ============================================================
- * Rx バッファ管理
- *   HAL_ETH_RxAllocateCallback で HAL にバッファを渡し、
- *   HAL_ETH_RxLinkCallback で受信データポインタを受け取る。
- *   シンプルな固定バッファプールで管理する。
+ * Rx バッファプール
+ *   HAL_ETH_RxAllocateCallback で空きバッファを HAL に渡し、
+ *   HAL_ETH_RxLinkCallback で受信データを受け取る。
  * ============================================================ */
 typedef struct {
     uint8_t  data[ETHCTL_RX_BUF_SIZE];
     bool     in_use;
 } RxBuf_t;
 
-/* 4バイトアライン。DCacheを無効にしているためsection指定不要 */
-static RxBuf_t s_rxpool[ETHCTL_RX_BUF_COUNT] __attribute__((aligned(4)));
-
-/* HAL_ETH_RxLinkCallback で受け取った受信済みバッファポインタ */
-static uint8_t *s_rx_received_buf  = NULL;
-static uint16_t s_rx_received_len  = 0;
+static RxBuf_t  s_rxpool[ETHCTL_RX_BUF_COUNT] __attribute__((aligned(4)));
+static uint8_t *s_rx_cur_buf = NULL;   /* 今回受信したバッファポインタ */
+static uint16_t s_rx_cur_len = 0;     /* 今回受信したデータ長 */
 
 /* ============================================================
- * Tx バッファ (送信組み立て用)
+ * Tx バッファ
  * ============================================================ */
 static uint8_t s_txbuf[ETHCTL_TX_BUF_SIZE] __attribute__((aligned(4)));
 
 /* ============================================================
- * HAL ETH ハンドル・送信設定
+ * HAL ETH ハンドル
  * ============================================================ */
-static ETH_HandleTypeDef     s_heth;
+static ETH_HandleTypeDef         s_heth;
 static ETH_TxPacketConfigTypeDef s_txcfg;
-
-/* DMAディスクリプタ: 4バイトアライン */
 static ETH_DMADescTypeDef s_rxdesc[ETH_RX_DESC_CNT] __attribute__((aligned(4)));
 static ETH_DMADescTypeDef s_txdesc[ETH_TX_DESC_CNT] __attribute__((aligned(4)));
+
+/* ============================================================
+ * lan8742 コンポーネント オブジェクト
+ *
+ *   lan8742.h が要求する IO 構造体 LAN8742_Object_t に
+ *   ReadReg / WriteReg / GetTick 関数ポインタを登録して使う。
+ *   実体は下記 prv_phy_io_init() で設定する。
+ * ============================================================ */
+static lan8742_Object_t   s_phy_obj;
+static lan8742_IOCtx_t    s_phy_io;
 
 /* ============================================================
  * ネットワーク状態
@@ -162,15 +214,14 @@ static uint8_t       s_dhcp_server[4];
 static EthIp4Addr_t  s_fb_ip, s_fb_mask, s_fb_gw;
 static bool          s_dhcp_renew = false;
 
-/* XID: 固定値 (複数デバイスが同一LAN上にいる場合は要ランダム化) */
 static const uint32_t DHCP_XID = 0xEC7A1B2CU;
 
 /* ============================================================
  * その他
  * ============================================================ */
 static volatile EthernetCtl_Request s_request = ETH_REQ_NONE;
-static uint16_t  s_ping_seq      = 0;
-static bool      s_blackout      = false;
+static uint16_t s_ping_seq  = 0;
+static bool     s_blackout  = false;
 
 static const uint8_t MAC_BCAST[6]  = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static const uint8_t IP_BCAST[4]   = {0xFF,0xFF,0xFF,0xFF};
@@ -181,8 +232,12 @@ static const uint8_t DHCP_MAGIC[4] = {0x63,0x82,0x53,0x63};
  * 内部プロトタイプ
  * ============================================================ */
 static bool     prv_hw_init(void);
-static bool     prv_phy_rd(uint32_t reg, uint32_t *v);
-static bool     prv_phy_wr(uint32_t reg, uint32_t v);
+static void     prv_phy_io_init(void);
+static int32_t  prv_phy_read_reg(uint32_t DevAddr, uint32_t RegAddr,
+                                  uint32_t *pRegVal);
+static int32_t  prv_phy_write_reg(uint32_t DevAddr, uint32_t RegAddr,
+                                   uint32_t RegVal);
+static int32_t  prv_phy_get_tick(void);
 static bool     prv_phy_link(void);
 static void     prv_link_up(void);
 static void     prv_link_down(void);
@@ -207,10 +262,43 @@ static uint8_t *prv_ip_b(const EthIp4Addr_t *a);
 static void     prv_eth_task(void *arg);
 
 /* ============================================================
+ * lan8742 IO コールバック: PHYレジスタ読み出し
+ *   lan8742コンポーネントから呼ばれる。
+ *   HAL_ETH_ReadPHYRegister() を呼び出す。
+ * ============================================================ */
+static int32_t prv_phy_read_reg(uint32_t DevAddr, uint32_t RegAddr,
+                                 uint32_t *pRegVal)
+{
+    if (HAL_ETH_ReadPHYRegister(&s_heth, DevAddr, RegAddr, pRegVal) == HAL_OK) {
+        return LAN8742_STATUS_OK;
+    }
+    return LAN8742_STATUS_READ_ERROR;
+}
+
+/* ============================================================
+ * lan8742 IO コールバック: PHYレジスタ書き込み
+ * ============================================================ */
+static int32_t prv_phy_write_reg(uint32_t DevAddr, uint32_t RegAddr,
+                                  uint32_t RegVal)
+{
+    if (HAL_ETH_WritePHYRegister(&s_heth, DevAddr, RegAddr, RegVal) == HAL_OK) {
+        return LAN8742_STATUS_OK;
+    }
+    return LAN8742_STATUS_WRITE_ERROR;
+}
+
+/* ============================================================
+ * lan8742 IO コールバック: TickカウンタをFreeRTOSから取得
+ * ============================================================ */
+static int32_t prv_phy_get_tick(void)
+{
+    return (int32_t)xTaskGetTickCount();
+}
+
+/* ============================================================
  * HAL RxAllocate コールバック (weak オーバーライド)
  *   HAL_ETH_ReadData() 内部から呼ばれる。
- *   空きバッファのアドレスを *buff に書いて返す。
- *   空きがなければ *buff = NULL を返す (その受信フレームは破棄される)。
+ *   空きバッファアドレスを *buff に書いて返す。
  * ============================================================ */
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
 {
@@ -222,19 +310,13 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
             return;
         }
     }
-    /* 空きなし: HAL はこのディスクリプタをスキップする */
+    /* 空きなし: このフレームは破棄される */
 }
 
 /* ============================================================
  * HAL RxLink コールバック (weak オーバーライド)
- *   HAL_ETH_ReadData() 内部から呼ばれる。
- *   1フレーム分のデータが buff / Length で渡される。
- *   pStart/pEnd は LWIP pbuf チェーン用だが、ここでは使わない。
- *   受信済みデータをポーリングループへ渡すために静的変数に保存する。
- *
- *   注意: 1回のポーリングで複数フレームが来た場合、最後の1フレームのみ
- *         処理される。実用上は 1ms ポーリングで問題ないが、高負荷時は
- *         s_rx_received_buf をキューに変更することを検討すること。
+ *   HAL_ETH_ReadData() 内部から受信完了時に呼ばれる。
+ *   受信バッファポインタと長さを静的変数に保存する。
  * ============================================================ */
 void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd,
                              uint8_t *buff, uint16_t Length)
@@ -242,17 +324,17 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd,
     (void)pStart;
     (void)pEnd;
 
-    /* 前回フレームが未処理の場合は破棄してバッファ解放 */
-    if (s_rx_received_buf != NULL) {
+    /* 前フレームが未処理の場合はバッファ解放して上書き */
+    if (s_rx_cur_buf != NULL) {
         for (uint32_t i = 0; i < ETHCTL_RX_BUF_COUNT; i++) {
-            if (s_rxpool[i].data == s_rx_received_buf) {
+            if (s_rxpool[i].data == s_rx_cur_buf) {
                 s_rxpool[i].in_use = false;
                 break;
             }
         }
     }
-    s_rx_received_buf = buff;
-    s_rx_received_len = Length;
+    s_rx_cur_buf = buff;
+    s_rx_cur_len = Length;
 }
 
 /* ============================================================
@@ -280,24 +362,20 @@ bool EthernetCtl_StartDhcpWithFallback(uint32_t timeout_ms,
     s_fb_mask = *fallback_mask;
     s_fb_gw   = *fallback_gw;
 
-    /* ミューテックス生成 */
     if (s_mutex == NULL) {
         s_mutex = xSemaphoreCreateMutex();
         if (s_mutex == NULL) return false;
     }
 
-    /* HW初期化 */
     if (!prv_hw_init()) return false;
 
-    /* ETHポーリングタスク生成 */
     if (xTaskCreate(prv_eth_task, "EthCtl",
                     ETHCTL_TASK_STACK, NULL,
                     ETHCTL_TASK_PRI, NULL) != pdPASS) {
         return false;
     }
 
-    /* DHCP完了 or フォールバック適用までブロッキング待機
-     * タイムアウトはDHCPタイムアウト + PHYリンクアップ猶予3秒 */
+    /* DHCP完了またはフォールバック適用まで待機 */
     TickType_t deadline = xTaskGetTickCount()
                           + pdMS_TO_TICKS(timeout_ms + 3000U);
     while (xTaskGetTickCount() < deadline) {
@@ -306,7 +384,6 @@ bool EthernetCtl_StartDhcpWithFallback(uint32_t timeout_ms,
             return (s_dhcp_st == DHCP_ST_BOUND);
         }
     }
-    /* タイムアウト: フォールバックを強制適用 */
     prv_dhcp_fallback();
     return false;
 }
@@ -337,8 +414,8 @@ void EthernetCtl_GetIpString(char *buf, size_t len)
  * ============================================================ */
 EthErr_t EthernetCtl_PingSend(const EthIp4Addr_t *dest)
 {
-    if (!dest)                                     return ETH_ERR_ARG;
-    if (!s_status.link_up)                         return ETH_ERR_NOLINK;
+    if (!dest)                                       return ETH_ERR_ARG;
+    if (!s_status.link_up)                           return ETH_ERR_NOLINK;
     if (prv_ip_eq(prv_ip_b(&s_status.ip), IP_ZERO)) return ETH_ERR_IF;
 
     static const uint8_t payload[] = "EthernetCtl_Ping";
@@ -353,7 +430,6 @@ EthErr_t EthernetCtl_PingSend(const EthIp4Addr_t *dest)
     IcmpHdr_t *ic  = (IcmpHdr_t *)((uint8_t*)ih + sizeof(IpHdr_t));
     uint8_t   *dat = (uint8_t*)ic + sizeof(IcmpHdr_t);
 
-    /* 宛先MACはブロードキャスト(ARPキャッシュなし簡易実装) */
     memcpy(eh->dst, MAC_BCAST,             6);
     memcpy(eh->src, s_status.mac,          6);
     eh->type = prv_htons(ETYPE_IP);
@@ -368,7 +444,7 @@ EthErr_t EthernetCtl_PingSend(const EthIp4Addr_t *dest)
     ih->csum      = prv_ip_csum(ih, sizeof(IpHdr_t));
 
     ic->type = ICMP_ECHO_REQ;
-    ic->id   = prv_htons(0xECA0);
+    ic->id   = prv_htons(0xECA0U);
     ic->seq  = prv_htons(s_ping_seq++);
     memcpy(dat, payload, plen);
     ic->csum = prv_icmp_csum(ic, dat, plen);
@@ -396,27 +472,56 @@ EthernetCtl_Request EthernetCtl_RequestGetAndClear(void)
 }
 
 /* ============================================================
- * Public: LAN8742A Blackout制御
+ * Public: LAN8742A LED Blackout制御
+ *
+ *   LAN8742A Control/Status Indication Register (Reg 0x1B) を使用。
+ *   Bit0 = LED Direct Mode Enable
+ *   Bit3 = LED1 value (0=OFF, 1=ON)
+ *   Bit4 = LED2 value (0=OFF, 1=ON)
+ *
+ *   enable=true  : LED Direct Mode ON, LED1/LED2 強制OFF → 消灯
+ *   enable=false : LED Direct Mode OFF → 通常のSpeed/Link表示に復帰
+ *
+ *   注意: このレジスタのアドレスとビット定義は LAN8742A データシートの
+ *         Rev3.0 Section 5.14 に基づく。ボードによっては配線が異なるため
+ *         LED1/LED2 の点灯論理が逆になる場合がある。
  * ============================================================ */
 bool EthernetCtl_Lan8742Blackout_Set(bool enable)
 {
-    uint32_t bcr = 0;
-    if (!prv_phy_rd(LAN8742_REG_BCR, &bcr)) return false;
+    uint32_t reg_val;
 
-    if (enable) bcr |=  LAN8742_BCR_PWRDN;
-    else        bcr &= ~LAN8742_BCR_PWRDN;
+    if (enable) {
+        /*
+         * LED Direct Mode有効 + LED1/LED2強制OFF
+         * Bit0=1 (Direct Mode ON)
+         * Bit3=0 (LED1 OFF)
+         * Bit4=0 (LED2 OFF)
+         */
+        reg_val = LAN8742_LED_DIRECT_MODE
+                | LAN8742_LED1_FORCE_OFF
+                | LAN8742_LED2_FORCE_OFF;
+    } else {
+        /*
+         * LED Direct Mode無効 → 通常動作に復帰
+         * Bit0=0 (Direct Mode OFF)
+         * Bit3/Bit4 は Direct Mode OFF時は無視される
+         */
+        reg_val = 0x0000U;
+    }
 
-    if (!prv_phy_wr(LAN8742_REG_BCR, bcr)) return false;
+    if (s_phy_io.WriteReg(s_phy_obj.DevAddr,
+                          LAN8742_CTRL_STATUS_IND_REG,
+                          reg_val) != LAN8742_STATUS_OK) {
+        return false;
+    }
 
     s_blackout = enable;
-    if (enable) {
-        prv_link_down();
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(300)); /* PHY起動待ち */
-    }
     return true;
 }
 
+/* ============================================================
+ * Public: Blackout解除 + DHCP再取得
+ * ============================================================ */
 bool EthernetCtl_Lan8742Blackout_RestoreWithDhcp(uint32_t timeout_ms,
                                                   const EthIp4Addr_t *fallback_ip,
                                                   const EthIp4Addr_t *fallback_mask,
@@ -445,73 +550,26 @@ bool EthernetCtl_Lan8742Blackout_RestoreWithDhcp(uint32_t timeout_ms,
 }
 
 /* ============================================================
- * 内部: FreeRTOS ETHタスク
+ * 内部: PHY IO 初期化
+ *   lan8742コンポーネントの IO 関数ポインタを登録し、
+ *   LAN8742_RegisterBusIO() → LAN8742_Init() を呼ぶ。
  * ============================================================ */
-static void prv_eth_task(void *arg)
+static void prv_phy_io_init(void)
 {
-    (void)arg;
-    TickType_t link_tick = xTaskGetTickCount();
-    bool       last_link = false;
+    s_phy_io.Init      = NULL;    /* GPIO init等が必要な場合はここに関数を設定 */
+    s_phy_io.DeInit    = NULL;
+    s_phy_io.ReadReg   = prv_phy_read_reg;
+    s_phy_io.WriteReg  = prv_phy_write_reg;
+    s_phy_io.GetTick   = prv_phy_get_tick;
 
-    vTaskDelay(pdMS_TO_TICKS(200)); /* PHY安定待ち */
-
-    for (;;) {
-        TickType_t now = xTaskGetTickCount();
-
-        /* ─ (1) PHY リンク監視 ─ */
-        if ((now - link_tick) >= pdMS_TO_TICKS(ETHCTL_LINK_POLL_MS)) {
-            link_tick = now;
-            if (!s_blackout) {
-                bool cur = prv_phy_link();
-                if ( cur && !last_link) prv_link_up();
-                if (!cur &&  last_link) prv_link_down();
-                last_link = cur;
-            }
-        }
-
-        /* ─ (2) DHCP再取得要求 ─ */
-        if (s_dhcp_renew && s_status.link_up) {
-            s_dhcp_renew   = false;
-            s_dhcp_st      = DHCP_ST_OFFER_WAIT;
-            s_dhcp_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(s_dhcp_timeout_ms);
-            prv_dhcp_discover();
-        }
-
-        /* ─ (3) DHCPタイムアウト監視 ─ */
-        now = xTaskGetTickCount();
-        if ((s_dhcp_st == DHCP_ST_OFFER_WAIT || s_dhcp_st == DHCP_ST_ACK_WAIT)
-            && (now >= s_dhcp_deadline)) {
-            prv_dhcp_fallback();
-        }
-
-        /* ─ (4) 受信ポーリング ─ */
-        if (s_status.link_up) {
-            prv_poll_rx();
-        }
-
-        /* ─ (5) リクエスト処理 ─ */
-        EthernetCtl_Request req = EthernetCtl_RequestGetAndClear();
-        switch (req) {
-        case ETH_REQ_LED_BLACKOUT_ON:
-            EthernetCtl_Lan8742Blackout_Set(true);
-            break;
-        case ETH_REQ_LED_BLACKOUT_OFF:
-            EthernetCtl_Lan8742Blackout_RestoreWithDhcp(
-                s_dhcp_timeout_ms, &s_fb_ip, &s_fb_mask, &s_fb_gw);
-            break;
-        default:
-            break;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
+    LAN8742_RegisterBusIO(&s_phy_obj, &s_phy_io);
+    LAN8742_Init(&s_phy_obj);
 }
 
 /* ============================================================
  * 内部: HW初期化
- *   GPIO設定は MX_GPIO_Init() (CubeMX生成) で済んでいるため
- *   ここでは HAL_ETH_Init のみ行う。
- *   MspInit は HAL_ETH_MspInit() (下記) でクロックを有効化する。
+ *   GPIO設定は main.c の MX_GPIO_Init() で済んでいるため
+ *   HAL_ETH_Init + lan8742初期化のみ実施する。
  * ============================================================ */
 static bool prv_hw_init(void)
 {
@@ -524,19 +582,21 @@ static bool prv_hw_init(void)
 
     if (HAL_ETH_Init(&s_heth) != HAL_OK) return false;
 
-    /* Tx設定: CRC/Padを自動挿入 */
+    /* lan8742 コンポーネント IO 登録 + PHY初期化 */
+    prv_phy_io_init();
+
+    /* Tx設定 */
     memset(&s_txcfg, 0, sizeof(s_txcfg));
-    s_txcfg.Attributes   = ETH_TX_PACKETS_FEATURES_CRCPAD;
-    s_txcfg.CRCPadCtrl   = ETH_CRC_PAD_INSERT;
+    s_txcfg.Attributes = ETH_TX_PACKETS_FEATURES_CRCPAD;
+    s_txcfg.CRCPadCtrl = ETH_CRC_PAD_INSERT;
 
     return true;
 }
 
 /* ============================================================
  * HAL_ETH_MspInit オーバーライド
- *   HAL_ETH_Init() 内部から呼ばれる。
- *   GPIO設定はCubeMX生成のMX_GPIO_Init()で済んでいるため、
- *   ここではETHクロック有効化のみ行う。
+ *   HAL_ETH_Init() 内部から呼ばれる。ETHクロック有効化のみ。
+ *   GPIOはCubeMX生成の MX_GPIO_Init() で設定済み。
  * ============================================================ */
 void HAL_ETH_MspInit(ETH_HandleTypeDef *heth)
 {
@@ -547,26 +607,24 @@ void HAL_ETH_MspInit(ETH_HandleTypeDef *heth)
 }
 
 /* ============================================================
- * 内部: PHY SMI読み書き
- * ============================================================ */
-static bool prv_phy_rd(uint32_t reg, uint32_t *v)
-{
-    return HAL_ETH_ReadPHYRegister(&s_heth, ETHCTL_PHY_ADDR, reg, v) == HAL_OK;
-}
-static bool prv_phy_wr(uint32_t reg, uint32_t v)
-{
-    return HAL_ETH_WritePHYRegister(&s_heth, ETHCTL_PHY_ADDR, reg, v) == HAL_OK;
-}
-
-/* ============================================================
- * 内部: PHY リンク確認 (BSR Bit2, 2回読み)
+ * 内部: PHY リンク確認
+ *   lan8742コンポーネントの LAN8742_GetLinkState() を使用する。
+ *   戻り値: LAN8742_STATUS_LINK_UP / LAN8742_STATUS_LINK_DOWN 等
  * ============================================================ */
 static bool prv_phy_link(void)
 {
-    uint32_t bsr = 0;
-    prv_phy_rd(LAN8742_REG_BSR, &bsr); /* 1回目: ラッチクリア */
-    prv_phy_rd(LAN8742_REG_BSR, &bsr); /* 2回目: 確定値       */
-    return (bsr & LAN8742_BSR_LINK) != 0U;
+    int32_t link_state = LAN8742_GetLinkState(&s_phy_obj);
+    /*
+     * LAN8742_GetLinkState() の戻り値:
+     *   LAN8742_STATUS_LINK_DOWN     (= 2)  : リンクなし
+     *   LAN8742_STATUS_AUTONEGO_NOTDONE (= 3): Auto-Neg未完了
+     *   LAN8742_STATUS_100MBITS_FULLDUPLEX(= 4)
+     *   LAN8742_STATUS_100MBITS_HALFDUPLEX(= 5)
+     *   LAN8742_STATUS_10MBITS_FULLDUPLEX (= 6)
+     *   LAN8742_STATUS_10MBITS_HALFDUPLEX (= 7)
+     *   LAN8742_STATUS_READ_ERROR    (-1)   : 通信エラー
+     */
+    return (link_state > LAN8742_STATUS_AUTONEGO_NOTDONE);
 }
 
 /* ============================================================
@@ -574,11 +632,10 @@ static bool prv_phy_link(void)
  * ============================================================ */
 static void prv_link_up(void)
 {
-    /* Auto-Negotiation 完了待ち (最大1秒) */
+    /* Auto-Negotiation 完了まで待機 (lan8742経由) */
     for (int i = 0; i < 100; i++) {
-        uint32_t bsr = 0;
-        prv_phy_rd(LAN8742_REG_BSR, &bsr);
-        if (bsr & LAN8742_BSR_ANEG) break;
+        int32_t state = LAN8742_GetLinkState(&s_phy_obj);
+        if (state > LAN8742_STATUS_AUTONEGO_NOTDONE) break;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
@@ -614,41 +671,92 @@ static void prv_link_down(void)
 }
 
 /* ============================================================
+ * 内部: FreeRTOS ETHタスク
+ * ============================================================ */
+static void prv_eth_task(void *arg)
+{
+    (void)arg;
+    TickType_t link_tick = xTaskGetTickCount();
+    bool       last_link = false;
+
+    vTaskDelay(pdMS_TO_TICKS(200)); /* PHY安定待ち */
+
+    for (;;) {
+        TickType_t now = xTaskGetTickCount();
+
+        /* ─ (1) PHYリンク監視 ─ */
+        if ((now - link_tick) >= pdMS_TO_TICKS(ETHCTL_LINK_POLL_MS)) {
+            link_tick = now;
+            if (!s_blackout) {
+                bool cur = prv_phy_link();
+                if ( cur && !last_link) prv_link_up();
+                if (!cur &&  last_link) prv_link_down();
+                last_link = cur;
+            }
+        }
+
+        /* ─ (2) DHCP再取得要求 ─ */
+        if (s_dhcp_renew && s_status.link_up) {
+            s_dhcp_renew    = false;
+            s_dhcp_st       = DHCP_ST_OFFER_WAIT;
+            s_dhcp_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(s_dhcp_timeout_ms);
+            prv_dhcp_discover();
+        }
+
+        /* ─ (3) DHCPタイムアウト監視 ─ */
+        now = xTaskGetTickCount();
+        if ((s_dhcp_st == DHCP_ST_OFFER_WAIT || s_dhcp_st == DHCP_ST_ACK_WAIT)
+            && (now >= s_dhcp_deadline)) {
+            prv_dhcp_fallback();
+        }
+
+        /* ─ (4) 受信ポーリング ─ */
+        if (s_status.link_up) prv_poll_rx();
+
+        /* ─ (5) リクエスト処理 ─ */
+        EthernetCtl_Request req = EthernetCtl_RequestGetAndClear();
+        switch (req) {
+        case ETH_REQ_LED_BLACKOUT_ON:
+            EthernetCtl_Lan8742Blackout_Set(true);
+            break;
+        case ETH_REQ_LED_BLACKOUT_OFF:
+            EthernetCtl_Lan8742Blackout_RestoreWithDhcp(
+                s_dhcp_timeout_ms, &s_fb_ip, &s_fb_mask, &s_fb_gw);
+            break;
+        default:
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+/* ============================================================
  * 内部: 受信ポーリング
- *   HAL_ETH_ReadData() を呼ぶと、内部で
- *     HAL_ETH_RxAllocateCallback() → バッファ確保
- *     HAL_ETH_RxLinkCallback()     → データ受け渡し
- *   が呼ばれ、s_rx_received_buf / s_rx_received_len にセットされる。
- *   受信データがなければ HAL_ERROR が返る。
  * ============================================================ */
 static void prv_poll_rx(void)
 {
     void *appbuf = NULL;
 
-    /* 受信フレームがある間ループ (最大 ETH_RX_DESC_CNT 回) */
     for (uint32_t i = 0; i < (uint32_t)ETH_RX_DESC_CNT; i++) {
+        s_rx_cur_buf = NULL;
+        s_rx_cur_len = 0;
 
-        s_rx_received_buf = NULL;
-        s_rx_received_len = 0;
+        if (HAL_ETH_ReadData(&s_heth, &appbuf) != HAL_OK) break;
 
-        if (HAL_ETH_ReadData(&s_heth, &appbuf) != HAL_OK) {
-            break; /* 受信フレームなし */
-        }
-
-        /* RxLinkCallback でセットされたデータを処理 */
-        if (s_rx_received_buf != NULL && s_rx_received_len > sizeof(EthHdr_t)) {
-            prv_dispatch(s_rx_received_buf, s_rx_received_len);
+        if (s_rx_cur_buf != NULL && s_rx_cur_len > (uint16_t)sizeof(EthHdr_t)) {
+            prv_dispatch(s_rx_cur_buf, s_rx_cur_len);
         }
 
         /* バッファ解放 */
-        if (s_rx_received_buf != NULL) {
+        if (s_rx_cur_buf != NULL) {
             for (uint32_t j = 0; j < ETHCTL_RX_BUF_COUNT; j++) {
-                if (s_rxpool[j].data == s_rx_received_buf) {
+                if (s_rxpool[j].data == s_rx_cur_buf) {
                     s_rxpool[j].in_use = false;
                     break;
                 }
             }
-            s_rx_received_buf = NULL;
+            s_rx_cur_buf = NULL;
         }
     }
 }
@@ -661,7 +769,6 @@ static void prv_dispatch(uint8_t *buf, uint16_t len)
     EthHdr_t *eh   = (EthHdr_t *)buf;
     uint16_t  type = prv_ntohs(eh->type);
 
-    /* 宛先が自分 or ブロードキャスト以外は捨てる */
     if (memcmp(eh->dst, s_status.mac, 6) != 0 &&
         memcmp(eh->dst, MAC_BCAST,    6) != 0) return;
 
@@ -675,30 +782,29 @@ static void prv_dispatch(uint8_t *buf, uint16_t len)
 static void prv_arp(uint8_t *buf, uint16_t len)
 {
     if (len < (uint16_t)(sizeof(EthHdr_t) + sizeof(ArpPkt_t))) return;
-
     EthHdr_t *eh  = (EthHdr_t *)buf;
     ArpPkt_t *arp = (ArpPkt_t *)(buf + sizeof(EthHdr_t));
 
-    if (prv_ntohs(arp->oper) != ARP_OP_REQ)                   return;
-    if (!prv_ip_eq(arp->tpa, prv_ip_b(&s_status.ip)))         return;
-    if (prv_ip_eq(prv_ip_b(&s_status.ip), IP_ZERO))           return;
+    if (prv_ntohs(arp->oper) != ARP_OP_REQ)               return;
+    if (!prv_ip_eq(arp->tpa, prv_ip_b(&s_status.ip)))     return;
+    if (prv_ip_eq(prv_ip_b(&s_status.ip), IP_ZERO))       return;
 
     uint8_t  rep[sizeof(EthHdr_t) + sizeof(ArpPkt_t)];
     EthHdr_t *re = (EthHdr_t *)rep;
     ArpPkt_t *ra = (ArpPkt_t *)(rep + sizeof(EthHdr_t));
 
-    memcpy(re->dst, eh->src,       6);
-    memcpy(re->src, s_status.mac,  6);
+    memcpy(re->dst, eh->src,      6);
+    memcpy(re->src, s_status.mac, 6);
     re->type = prv_htons(ETYPE_ARP);
 
     ra->htype = prv_htons(1U);
     ra->ptype = prv_htons(0x0800U);
     ra->hlen  = 6; ra->plen = 4;
     ra->oper  = prv_htons(ARP_OP_REP);
-    memcpy(ra->sha, s_status.mac,              6);
-    memcpy(ra->spa, prv_ip_b(&s_status.ip),    4);
-    memcpy(ra->tha, arp->sha,                  6);
-    memcpy(ra->tpa, arp->spa,                  4);
+    memcpy(ra->sha, s_status.mac,           6);
+    memcpy(ra->spa, prv_ip_b(&s_status.ip), 4);
+    memcpy(ra->tha, arp->sha,               6);
+    memcpy(ra->tpa, arp->spa,               4);
 
     prv_tx(rep, (uint16_t)sizeof(rep));
 }
@@ -709,20 +815,17 @@ static void prv_arp(uint8_t *buf, uint16_t len)
 static void prv_ip(uint8_t *buf, uint16_t len)
 {
     if (len < (uint16_t)(sizeof(EthHdr_t) + sizeof(IpHdr_t))) return;
-
     IpHdr_t *iph = (IpHdr_t *)(buf + sizeof(EthHdr_t));
 
     bool for_me = prv_ip_eq(iph->dst, prv_ip_b(&s_status.ip))
                || prv_ip_eq(iph->dst, IP_BCAST);
-
     bool dhcp_rx = (s_dhcp_st == DHCP_ST_OFFER_WAIT
                  || s_dhcp_st == DHCP_ST_ACK_WAIT);
 
-    if (iph->proto == IPPROTO_ICMP && for_me) {
+    if (iph->proto == IPPROTO_ICMP && for_me)
         prv_icmp(buf, len, iph);
-    } else if (iph->proto == IPPROTO_UDP && (for_me || dhcp_rx)) {
+    else if (iph->proto == IPPROTO_UDP && (for_me || dhcp_rx))
         prv_udp(buf, len, iph);
-    }
 }
 
 /* ============================================================
@@ -730,18 +833,17 @@ static void prv_ip(uint8_t *buf, uint16_t len)
  * ============================================================ */
 static void prv_icmp(uint8_t *buf, uint16_t len, IpHdr_t *iph)
 {
-    uint16_t   ip_hl  = (uint16_t)((iph->ver_ihl & 0x0FU) * 4U);
-    IcmpHdr_t *ic     = (IcmpHdr_t *)((uint8_t*)iph + ip_hl);
-    uint16_t   iclen  = prv_ntohs(iph->total_len) - ip_hl;
+    uint16_t   ip_hl = (uint16_t)((iph->ver_ihl & 0x0FU) * 4U);
+    IcmpHdr_t *ic    = (IcmpHdr_t *)((uint8_t*)iph + ip_hl);
+    uint16_t   iclen = prv_ntohs(iph->total_len) - ip_hl;
 
-    if (iclen < sizeof(IcmpHdr_t))    return;
-    if (ic->type != ICMP_ECHO_REQ)   return;
+    if (iclen < (uint16_t)sizeof(IcmpHdr_t)) return;
+    if (ic->type != ICMP_ECHO_REQ)            return;
 
     uint8_t *payload = (uint8_t*)ic + sizeof(IcmpHdr_t);
     uint16_t plen    = iclen - (uint16_t)sizeof(IcmpHdr_t);
-
-    uint16_t total = (uint16_t)(sizeof(EthHdr_t) + sizeof(IpHdr_t)
-                                + sizeof(IcmpHdr_t) + plen);
+    uint16_t total   = (uint16_t)(sizeof(EthHdr_t) + sizeof(IpHdr_t) +
+                                  sizeof(IcmpHdr_t) + plen);
     if (total > ETHCTL_TX_BUF_SIZE) return;
 
     memset(s_txbuf, 0, total);
@@ -751,8 +853,8 @@ static void prv_icmp(uint8_t *buf, uint16_t len, IpHdr_t *iph)
     uint8_t   *rd  = (uint8_t*)ric + sizeof(IcmpHdr_t);
 
     EthHdr_t *oeh = (EthHdr_t *)buf;
-    memcpy(re->dst, oeh->src,              6);
-    memcpy(re->src, s_status.mac,          6);
+    memcpy(re->dst, oeh->src,             6);
+    memcpy(re->src, s_status.mac,         6);
     re->type = prv_htons(ETYPE_IP);
 
     ri->ver_ihl   = 0x45;
@@ -785,8 +887,7 @@ static void prv_udp(uint8_t *buf, uint16_t len, IpHdr_t *iph)
     if (len < (uint16_t)(sizeof(EthHdr_t) + ip_hl + sizeof(UdpHdr_t))) return;
 
     if (prv_ntohs(udp->sp) == DHCP_SRV_PORT &&
-        prv_ntohs(udp->dp) == DHCP_CLI_PORT)
-    {
+        prv_ntohs(udp->dp) == DHCP_CLI_PORT) {
         DhcpPkt_t *dhcp = (DhcpPkt_t *)((uint8_t*)udp + sizeof(UdpHdr_t));
         uint16_t   dlen = prv_ntohs(udp->len) - (uint16_t)sizeof(UdpHdr_t);
         prv_dhcp_rx(dhcp, dlen);
@@ -803,9 +904,9 @@ static void prv_dhcp_rx(DhcpPkt_t *dhcp, uint16_t len)
     if (prv_htonl(dhcp->xid) != DHCP_XID)              return;
     if (memcmp(dhcp->magic, DHCP_MAGIC, 4) != 0)        return;
 
-    uint8_t  msg    = 0;
-    uint8_t  srv[4] = {0}, sub[4] = {0}, gw[4] = {0};
-    bool     hsrv   = false, hsub = false, hgw = false;
+    uint8_t msg    = 0;
+    uint8_t srv[4] = {0}, sub[4] = {0}, gw[4] = {0};
+    bool    hsrv = false, hsub = false, hgw = false;
 
     uint8_t *o = dhcp->options;
     uint8_t *e = dhcp->options + sizeof(dhcp->options);
@@ -816,15 +917,14 @@ static void prv_dhcp_rx(DhcpPkt_t *dhcp, uint16_t len)
         uint8_t olen = *o++;
         if (o + olen > e) break;
         switch (code) {
-        case 53: if (olen >= 1) msg    = o[0];                        break;
-        case 54: if (olen >= 4) { memcpy(srv, o, 4); hsrv = true; }  break;
-        case  1: if (olen >= 4) { memcpy(sub, o, 4); hsub = true; }  break;
-        case  3: if (olen >= 4) { memcpy(gw,  o, 4); hgw  = true; }  break;
+        case 53: if (olen >= 1) msg = o[0];                        break;
+        case 54: if (olen >= 4) { memcpy(srv, o, 4); hsrv = true; } break;
+        case  1: if (olen >= 4) { memcpy(sub, o, 4); hsub = true; } break;
+        case  3: if (olen >= 4) { memcpy(gw,  o, 4); hgw  = true; } break;
         }
         o += olen;
     }
 
-    /* OFFER → REQUEST */
     if (msg == DHCP_MSG_OFFER && s_dhcp_st == DHCP_ST_OFFER_WAIT) {
         memcpy(s_dhcp_offered, dhcp->yiaddr, 4);
         if (hsrv) memcpy(s_dhcp_server, srv, 4);
@@ -832,11 +932,9 @@ static void prv_dhcp_rx(DhcpPkt_t *dhcp, uint16_t len)
         prv_dhcp_request();
         return;
     }
-
-    /* ACK → IPアドレス確定 */
     if (msg == DHCP_MSG_ACK && s_dhcp_st == DHCP_ST_ACK_WAIT) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        memcpy(&s_status.ip.addr,   dhcp->yiaddr, 4);
+        memcpy(&s_status.ip.addr, dhcp->yiaddr, 4);
         if (hsub) memcpy(&s_status.mask.addr, sub, 4);
         if (hgw)  memcpy(&s_status.gw.addr,   gw,  4);
         s_status.is_dhcp = true;
@@ -844,7 +942,6 @@ static void prv_dhcp_rx(DhcpPkt_t *dhcp, uint16_t len)
         s_dhcp_st = DHCP_ST_BOUND;
         return;
     }
-
     if (msg == DHCP_MSG_NAK) prv_dhcp_fallback();
 }
 
@@ -868,7 +965,7 @@ static void prv_dhcp_discover(void)
     eh->type = prv_htons(ETYPE_IP);
 
     ih->ver_ihl   = 0x45;
-    ih->total_len = prv_htons((uint16_t)(sizeof(IpHdr_t) + sizeof(UdpHdr_t) + sizeof(DhcpPkt_t)));
+    ih->total_len = prv_htons((uint16_t)(sizeof(IpHdr_t)+sizeof(UdpHdr_t)+sizeof(DhcpPkt_t)));
     ih->id        = prv_htons(0xDC01U);
     ih->ttl       = 64;
     ih->proto     = IPPROTO_UDP;
@@ -877,12 +974,12 @@ static void prv_dhcp_discover(void)
 
     uh->sp  = prv_htons(DHCP_CLI_PORT);
     uh->dp  = prv_htons(DHCP_SRV_PORT);
-    uh->len = prv_htons((uint16_t)(sizeof(UdpHdr_t) + sizeof(DhcpPkt_t)));
+    uh->len = prv_htons((uint16_t)(sizeof(UdpHdr_t)+sizeof(DhcpPkt_t)));
 
     dhcp->op    = DHCP_OP_REQ;
     dhcp->htype = 1; dhcp->hlen = 6;
     dhcp->xid   = prv_htonl(DHCP_XID);
-    dhcp->flags = prv_htons(0x8000U); /* Broadcast flag */
+    dhcp->flags = prv_htons(0x8000U);
     memcpy(dhcp->chaddr, s_status.mac, 6);
     memcpy(dhcp->magic,  DHCP_MAGIC,   4);
 
@@ -914,7 +1011,7 @@ static void prv_dhcp_request(void)
     eh->type = prv_htons(ETYPE_IP);
 
     ih->ver_ihl   = 0x45;
-    ih->total_len = prv_htons((uint16_t)(sizeof(IpHdr_t) + sizeof(UdpHdr_t) + sizeof(DhcpPkt_t)));
+    ih->total_len = prv_htons((uint16_t)(sizeof(IpHdr_t)+sizeof(UdpHdr_t)+sizeof(DhcpPkt_t)));
     ih->id        = prv_htons(0xDC02U);
     ih->ttl       = 64;
     ih->proto     = IPPROTO_UDP;
@@ -923,7 +1020,7 @@ static void prv_dhcp_request(void)
 
     uh->sp  = prv_htons(DHCP_CLI_PORT);
     uh->dp  = prv_htons(DHCP_SRV_PORT);
-    uh->len = prv_htons((uint16_t)(sizeof(UdpHdr_t) + sizeof(DhcpPkt_t)));
+    uh->len = prv_htons((uint16_t)(sizeof(UdpHdr_t)+sizeof(DhcpPkt_t)));
 
     dhcp->op    = DHCP_OP_REQ;
     dhcp->htype = 1; dhcp->hlen = 6;
@@ -943,7 +1040,7 @@ static void prv_dhcp_request(void)
 }
 
 /* ============================================================
- * 内部: DHCP失敗 → フォールバックIP設定
+ * 内部: DHCP失敗 → フォールバックIP適用
  * ============================================================ */
 static void prv_dhcp_fallback(void)
 {
@@ -965,15 +1062,13 @@ static bool prv_tx(uint8_t *buf, uint16_t len)
     tb.buffer = buf;
     tb.len    = len;
     tb.next   = NULL;
-
     s_txcfg.Length   = len;
     s_txcfg.TxBuffer = &tb;
-
     return HAL_ETH_Transmit(&s_heth, &s_txcfg, 100U) == HAL_OK;
 }
 
 /* ============================================================
- * 内部: チェックサム計算
+ * 内部: IPチェックサム
  * ============================================================ */
 static uint16_t prv_ip_csum(const void *buf, uint16_t len)
 {
@@ -985,9 +1080,11 @@ static uint16_t prv_ip_csum(const void *buf, uint16_t len)
     return (uint16_t)(~sum);
 }
 
+/* ============================================================
+ * 内部: ICMPチェックサム
+ * ============================================================ */
 static uint16_t prv_icmp_csum(IcmpHdr_t *h, const uint8_t *data, uint16_t dlen)
 {
-    /* ヘッダのcsumsフィールドを0にして計算 */
     IcmpHdr_t tmp = *h; tmp.csum = 0;
     uint32_t sum = 0;
     const uint16_t *p;
@@ -1013,9 +1110,9 @@ static uint16_t prv_htons(uint16_t v)
 }
 static uint32_t prv_htonl(uint32_t v)
 {
-    return ((v >> 24U) & 0xFFU)        |
-           (((v >> 16U) & 0xFFU) << 8U) |
-           (((v >>  8U) & 0xFFU) << 16U)|
+    return ((v >> 24U) & 0xFFU)         |
+           (((v >> 16U) & 0xFFU) <<  8U) |
+           (((v >>  8U) & 0xFFU) << 16U) |
            ((v & 0xFFU) << 24U);
 }
 static uint16_t prv_ntohs(uint16_t v) { return prv_htons(v); }

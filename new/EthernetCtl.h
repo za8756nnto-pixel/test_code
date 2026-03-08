@@ -6,9 +6,8 @@
  *
  *  LWIPなし・FreeRTOSポーリングベース ETHドライバ
  *  対象MCU : STM32H745/H755 デュアルコア (CM7で動作)
- *  対象PHY : LAN8742A (RMII)
- *  使用HAL : HAL_ETH_ReadData / HAL_ETH_Transmit 版
- *            (HAL_ETH_RxAllocateCallback / HAL_ETH_RxLinkCallback オーバーライド)
+ *  対象PHY : LAN8742A (CubeMX lan8742コンポーネント使用)
+ *  使用HAL : HAL_ETH_ReadData / HAL_ETH_Transmit
  */
 
 #ifndef INC_ETHERNETCTL_H_
@@ -23,7 +22,7 @@ extern "C" {
 #include <stddef.h>
 
 /* ============================================================
- * IP アドレス型 (LWIP不要・独自定義)
+ * IPアドレス型 (LWIP不要・独自定義)
  * ============================================================ */
 typedef struct {
     uint32_t addr;  /*!< バイト列格納: [0]=a, [1]=b, [2]=c, [3]=d */
@@ -90,7 +89,7 @@ bool EthernetCtl_SetMac(const uint8_t mac[6]);
 /**
  * @brief  ETH初期化 + DHCP取得。失敗時はフォールバックIPを使用。
  *         内部でFreeRTOSタスクを生成する。一度だけ呼ぶこと。
- *         osKernelStart() 後 (スケジューラ起動後) に呼ぶこと。
+ *         osKernelStart() 後 (スケジューラ起動後タスク内) に呼ぶこと。
  * @param  timeout_ms    DHCPタイムアウト[ms]
  * @param  fallback_ip   DHCP失敗時IP   (NULL不可)
  * @param  fallback_mask DHCP失敗時Mask (NULL不可)
@@ -130,14 +129,18 @@ void EthernetCtl_RequestSet(EthernetCtl_Request req);
 EthernetCtl_Request EthernetCtl_RequestGetAndClear(void);
 
 /**
- * @brief  LAN8742A PHYをパワーダウンしLED消灯する
- * @param  enable  true=消灯(Blackout), false=復帰
+ * @brief  LAN8742A PHY LEDをブラックアウト(消灯)または復帰させる
+ *
+ *         LAN8742A の PHYSCSR (Reg0x11) の LED制御ビットを操作する。
+ *         enable=true  : LED強制OFF (ブラックアウト)
+ *         enable=false : LED通常動作に復帰
+ *
  * @retval true=成功, false=PHYアクセス失敗
  */
 bool EthernetCtl_Lan8742Blackout_Set(bool enable);
 
 /**
- * @brief  Blackout解除 + DHCP再取得
+ * @brief  LAN8742A LEDブラックアウト解除 + DHCP再取得
  * @retval true=DHCP成功, false=フォールバックIP使用
  */
 bool EthernetCtl_Lan8742Blackout_RestoreWithDhcp(uint32_t timeout_ms,
